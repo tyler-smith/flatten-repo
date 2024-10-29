@@ -7,7 +7,7 @@ use std::process;
 #[command(name = "flatten-repo")]
 struct Cli {
     /// Recursively process directories
-    #[arg(short = 'R', short_alias = 'r', long)]
+    #[arg(short = 'R', short_alias = 'r', long, default_value = "true")]
     recursive: bool,
 
     /// Enable verbose output
