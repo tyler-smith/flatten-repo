@@ -14,9 +14,9 @@ struct Cli {
     #[arg(short = 'V', short_alias = 'v', long)]
     verbose: bool,
 
-    /// Exclude files matching pattern (can be specified multiple times)
-    #[arg(short = 'E', short_alias = 'e', long)]
-    exclude: Vec<String>,
+    /// Ignore files matching pattern (can be specified multiple times)
+    #[arg(short = 'I', short_alias = 'i', long)]
+    ignore: Vec<String>,
 
     /// File paths or globs to process
     paths: Vec<String>,
@@ -28,7 +28,7 @@ fn main() {
     let config = Config {
         recursive: args.recursive,
         verbose: args.verbose,
-        exclude_patterns: args.exclude,
+        ignore_patterns: args.ignore,
         paths: args.paths,
     };
 

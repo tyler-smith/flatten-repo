@@ -13,6 +13,11 @@ use quick_xml::{
 };
 use thiserror::Error;
 
+const XML_NODE_TYPE_REPO: &str = "repository";
+const XML_NODE_TYPE_FILE: &str = "file";
+
+const BINARY_FILE_CHECK_SIZE: usize = 8192;
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("IO error: {0}")]
@@ -31,77 +36,65 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub enum FileType {
+    Text(String),
+    Binary,
+}
+
 pub struct Config {
     pub recursive: bool,
     pub verbose: bool,
-    pub exclude_patterns: Vec<String>,
+    pub ignore_patterns: Vec<String>,
     pub paths: Vec<String>,
 }
 
 pub struct FlattenRepo {
     config: Config,
     git_repo: Option<Repository>,
-    exclude_patterns: Vec<Pattern>,
+    ignore_patterns: Vec<Pattern>,
 }
 
 impl FlattenRepo {
     pub fn new(config: Config) -> Result<Self> {
         let git_repo = Repository::discover(".").ok();
 
-        let _ = Pattern::parse(without_escape("*.git"))?;
-
-        // Parse the exclude patterns once during initialization
-        let exclude_patterns = config.exclude_patterns
+        // Parse the ignore patterns once during initialization
+        let ignore_patterns = config.ignore_patterns
             .iter()
             .map(|p| Pattern::parse(without_escape(p)).map_err(Error::from))
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Self { config, git_repo, exclude_patterns })
+        Ok(Self { config, git_repo, ignore_patterns })
     }
 
+    // Generate the XML structure from the files found based on the config.
+    pub fn generate_xml(&self) -> Result<String> {
+        let files = self.find_files()?;
+        self.generate_xml_from_files(files)
+    }
+
+    // Logs messages if and only if we're in verbose mode.
     fn log_verbose(&self, msg: &str) {
         if self.config.verbose {
             eprintln!("{}", msg);
         }
     }
 
+    // Check if a path is ignored by git
     fn is_ignored_by_git(&self, path: &Path) -> bool {
-        if let Some(repo) = &self.git_repo {
+        self.git_repo.as_ref().map_or(false, |repo| {
             repo.status_should_ignore(path).unwrap_or(false)
-        } else {
-            false
-        }
+        })
     }
 
-    fn should_exclude(&self, path: &str) -> bool {
-        self.exclude_patterns.iter().any(|pattern| {
-            // Find any match in the string
+    // Check if a path is ignored by any of our ignore patterns
+    fn is_ignored_by_patterns(&self, path: &str) -> bool {
+        self.ignore_patterns.iter().any(|pattern| {
             pattern.find(path).is_some()
         })
     }
 
-    fn is_binary_file(path: &Path) -> Result<bool> {
-        let mut file = File::open(path)?;
-        let mut buffer = [0; 8192];
-        let n = file.read(&mut buffer)?;
-        Ok(buffer[..n].contains(&0))
-    }
-
-    fn read_file_contents(path: &Path) -> Result<(bool, Option<String>)> {
-        if Self::is_binary_file(path)? {
-            return Ok((true, None));
-        }
-
-        let file = File::open(path)?;
-        let mut decoder = DecodeReaderBytesBuilder::new()
-            .encoding(Some(UTF_8))
-            .build(file);
-
-        let mut content = String::new();
-        decoder.read_to_string(&mut content)?;
-        Ok((false, Some(content)))
-    }
-
+    // Find all files matching the patterns in the config, respecting ignore conditions.
     fn find_files(&self) -> Result<Vec<PathBuf>> {
         let mut seen_files = std::collections::HashSet::new();
         let mut files = Vec::new();
@@ -109,6 +102,7 @@ impl FlattenRepo {
         for pattern in &self.config.paths {
             self.log_verbose(&format!("Processing pattern: {}", pattern));
 
+            // Append globstar to directories if we want to recurse
             let pattern = if self.config.recursive && Path::new(pattern).is_dir() {
                 format!("{}/**/*", pattern)
             } else {
@@ -120,8 +114,8 @@ impl FlattenRepo {
                 let path = PathBuf::from(&pattern);
                 let relpath = path.strip_prefix(".").unwrap_or(&path);
                 if !seen_files.contains(relpath) {
-                    if self.should_exclude(relpath.to_string_lossy().as_ref()) {
-                        self.log_verbose(&format!("Excluding file (matched exclude pattern): {}", relpath.display()));
+                    if self.is_ignored_by_patterns(relpath.to_string_lossy().as_ref()) {
+                        self.log_verbose(&format!("Excluding file (matched ignore pattern): {}", relpath.display()));
                         continue;
                     }
                     if self.is_ignored_by_git(relpath) {
@@ -150,8 +144,8 @@ impl FlattenRepo {
                             continue;
                         }
 
-                        if self.should_exclude(relpath.to_string_lossy().as_ref()) {
-                            self.log_verbose(&format!("Excluding file (matched exclude pattern): {}", relpath.display()));
+                        if self.is_ignored_by_patterns(relpath.to_string_lossy().as_ref()) {
+                            self.log_verbose(&format!("Excluding file (matched ignore pattern): {}", relpath.display()));
                             continue;
                         }
 
@@ -172,24 +166,48 @@ impl FlattenRepo {
         Ok(files)
     }
 
-    pub fn generate_xml(&self) -> Result<String> {
-        let files = self.find_files()?;
+    // Read the contents of a file, checking for binary content.
+    // If the file is binary, we stop reading and don't return the contents.
+    fn read_file_contents(path: &Path) -> Result<(bool, Option<String>)> {
+        let file = File::open(path)?;
+        let mut decoder = DecodeReaderBytesBuilder::new()
+            .encoding(Some(UTF_8))
+            .build(file);
+
+        // Read initial chunk and return early if the content appears to be binary
+        let mut initial_buffer = Vec::with_capacity(BINARY_FILE_CHECK_SIZE);
+        {
+            let mut limited_reader = decoder.by_ref().take(BINARY_FILE_CHECK_SIZE as u64);
+            let bytes_read = limited_reader.read_to_end(&mut initial_buffer)?;
+            if initial_buffer[..bytes_read].contains(&0) {
+                return Ok((true, None));
+            }
+        }
+
+        // We have a text file so convert initial chunk to string and read the rest
+        let mut content = String::with_capacity(initial_buffer.len());
+        content.push_str(&String::from_utf8_lossy(&initial_buffer));
+        decoder.read_to_string(&mut content)?;
+
+        Ok((false, Some(content)))
+    }
+
+    // Create the XML structure from the given file list.
+    fn generate_xml_from_files(&self, files: Vec<PathBuf>) -> Result<String> {
+        // Create an XML writer and start writing the document
         let mut writer = Writer::new(Vec::new());
-
-        // Write XML declaration
         writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
+        writer.write_event(Event::Start(BytesStart::new(XML_NODE_TYPE_REPO)))?;
 
-
-        // Write root element
-        writer.write_event(Event::Start(BytesStart::new("repo")))?;
-
+        // Iterate files and create elements for each one
         for path in files {
-            let (is_binary, content) = Self::read_file_contents(&path)?;
+            // Create the file element
+            let mut elem = BytesStart::new(XML_NODE_TYPE_FILE);
             let path_str = path.to_string_lossy();
-
-            let mut elem = BytesStart::new("file");
             elem.push_attribute(("path", path_str.as_ref()));
 
+            // Add the file contents/attributes
+            let (is_binary, content) = Self::read_file_contents(&path)?;
             if is_binary {
                 self.log_verbose(&format!("Processing as binary file: {}", path_str));
                 elem.push_attribute(("binary", "true"));
@@ -200,12 +218,14 @@ impl FlattenRepo {
                 if let Some(content) = content {
                     writer.write_event(Event::Text(BytesText::new(&content)))?;
                 }
-                writer.write_event(Event::End(BytesEnd::new("file")))?;
+                writer.write_event(Event::End(BytesEnd::new(XML_NODE_TYPE_FILE)))?;
             }
         }
 
-        writer.write_event(Event::End(BytesEnd::new("repo")))?;
+        // Close the root element
+        writer.write_event(Event::End(BytesEnd::new(XML_NODE_TYPE_REPO)))?;
 
+        // Convert to an XML string
         String::from_utf8(writer.into_inner())
             .map_err(|e| Error::Path(e.to_string()))
     }
