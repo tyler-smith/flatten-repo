@@ -56,6 +56,16 @@ pub struct FlattenRepo {
 
 impl FlattenRepo {
     pub fn new(config: Config) -> Result<Self> {
+        // If no paths are provided, default to the current directory
+        let config = if config.paths.is_empty() {
+            let mut config = config;
+            config.paths = vec![".".to_string()];
+            config
+        } else {
+            config
+        };
+
+        // Find the git repository if we're in one
         let git_repo = Repository::discover(".").ok();
 
         // Parse the ignore patterns once during initialization
